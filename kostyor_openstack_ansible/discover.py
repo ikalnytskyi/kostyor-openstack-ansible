@@ -14,6 +14,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 import collections
+import os
 
 from ansible.inventory import Inventory
 from ansible.parsing.dataloader import DataLoader
@@ -26,6 +27,9 @@ from kostyor.rpc.app import app
 # This is a map of Ansible groups to OpenStack services. In other words,
 # all hosts of the following groups have the following services assigned
 # to them.
+
+_DEFAULT_INVENTORY_CONF = '/etc/openstack_deploy'
+
 _SERVICES_BY_INVENTORY_GROUPS = {
     'keystone': [
         'keystone-wsgi-admin',
@@ -132,6 +136,18 @@ _SERVICES_BY_INVENTORY_GROUPS = {
 }
 
 
+def _get_region_from_user_configs(inventory_conf=_DEFAULT_INVENTORY_CONF):
+    dl = DataLoader()
+    if os.path.exists(inventory_conf):
+        for root, _, files in os.walk(inventory_conf):
+            for name in files:
+                if name.endswith(('.yml', '.yaml')):
+                    user_vars = dl.load_from_file(os.path.join(root, name))
+                    if 'service_region' in user_vars:
+                        return user_vars['service_region']
+    return None
+
+
 @app.task
 def _get_hosts():
     """Inspect OpenStack Ansible setup for hosts and services. Returned
@@ -139,13 +155,19 @@ def _get_hosts():
     Here's an example::
 
         {
-            'host-1': [
-                {'name': 'nova-conductor'},
-                {'name': 'nova-api'},
-            ],
-            'host-2': [
-                {'name': 'nova-compute'},
-            ],
+            'regions': {
+                'RegionOne': {
+                    'hosts': {
+                        'host-1': [
+                            {'name': 'nova-conductor'},
+                            {'name': 'nova-api'},
+                        ],
+                        'host-2': [
+                            {'name': 'nova-compute'},
+                        ],
+                    }
+                }
+            }
         }
 
     Please note, in some case we may return extra services due to bugs
@@ -153,8 +175,11 @@ def _get_hosts():
     Though they won't affect upgrade procedure, they might be a little
     misleading.
     """
-    rv = collections.defaultdict(list)
-    inventory = Inventory(DataLoader(), VariableManager())
+    rv = {}
+    variable_manager = VariableManager()
+    data_loader = DataLoader()
+    inventory = Inventory(data_loader, variable_manager)
+    region = _get_region_from_user_configs()
 
     for group, services in _SERVICES_BY_INVENTORY_GROUPS.items():
         group = inventory.get_group(group)
@@ -163,13 +188,21 @@ def _get_hosts():
             continue
 
         for host in group.get_hosts():
+            if not region:
+                host_vars = variable_manager.get_vars(data_loader, host=host)
+                region = host_vars.get('service_region', 'Unknown')
+
+            if region not in rv:
+                rv[region] = {'hosts': collections.defaultdict(list)}
+
             # TODO: Process services to be added as not of them may be
             #       applied to the current setup. E.g., Neutron may be
             #       configured to use openvswitch instead of linux bridges,
             #       while we always add both of them. It doesn't affect
             #       upgrade procedure, though, since services are used
             #       to build an upgrade order and no more.
-            rv[host.get_vars()['physical_host']].extend((
+            physical_host = host.get_vars()['physical_host']
+            rv[region]['hosts'][physical_host].extend((
                 {'name': service} for service in services
             ))
 
@@ -180,5 +213,5 @@ class Driver(ServiceDiscovery):
 
     def discover(self):
         return {
-            'hosts': _get_hosts.delay().get(),
+            'regions':  _get_hosts.delay().get(),
         }
